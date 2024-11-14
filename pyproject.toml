@@ -1,6 +1,6 @@
 [project]
-name = "open_webui"
-description = "Open WebUI"
+name = "better-gpt"
+description = "BetterGPT"
 authors = [
     { name = "Michael Wlt", email = "michael.wlt@proton.me" }
 ]
