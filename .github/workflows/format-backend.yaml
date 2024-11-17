@@ -3,11 +3,11 @@ name: Python CI
 on:
   push:
     branches:
-      - main
+      - production
       - dev
   pull_request:
     branches:
-      - main
+      - production
       - dev
 
 jobs:
