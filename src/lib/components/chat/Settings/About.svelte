@@ -137,8 +137,16 @@
 			<a
 				class=" text-gray-500 dark:text-gray-300 font-medium"
 				href="https://github.com/tjbck"
-				target="_blank">Timothy J. Baek</a
+				target="_blank">Michael Wolters</a
 			>
+			<div>
+				<a
+					class="text-gray-500 dark:text-gray-300"
+					href="https://www.flaticon.com/free-icons/pet"
+					title="pet icons"
+					target="_blank">Pet icons created by Sergei Kokota - Flaticon</a
+				>
+			</div>
 		</div>
 	</div>
 </div>
