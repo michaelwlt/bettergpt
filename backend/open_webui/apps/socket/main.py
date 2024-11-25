@@ -1,221 +1,203 @@
 # TODO: move socket to webui app
 
 import asyncio
-import socketio
 import logging
-import sys
-import time
+from typing import Dict
 
+import socketio
+from fastapi import FastAPI
+
+from open_webui.apps.webui.internal.db import get_db
+from open_webui.apps.webui.models.sessions import SessionManager, UserSession
 from open_webui.apps.webui.models.users import Users
+from open_webui.apps.webui.jobs.session_cleanup import SessionCleanupJob
 from open_webui.env import (
-    ENABLE_WEBSOCKET_SUPPORT,
+    SRC_LOG_LEVELS,
     WEBSOCKET_MANAGER,
     WEBSOCKET_REDIS_URL,
 )
 from open_webui.utils.utils import decode_token
-from open_webui.apps.socket.utils import RedisDict
 
-from open_webui.env import (
-    GLOBAL_LOG_LEVEL,
-    SRC_LOG_LEVELS,
-)
-
-
-logging.basicConfig(stream=sys.stdout, level=GLOBAL_LOG_LEVEL)
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["SOCKET"])
 
-
-if WEBSOCKET_MANAGER == "redis":
-    mgr = socketio.AsyncRedisManager(WEBSOCKET_REDIS_URL)
-    sio = socketio.AsyncServer(
-        cors_allowed_origins=[],
-        async_mode="asgi",
-        transports=(
-            ["polling", "websocket"] if ENABLE_WEBSOCKET_SUPPORT else ["polling"]
-        ),
-        allow_upgrades=ENABLE_WEBSOCKET_SUPPORT,
-        always_connect=True,
-        client_manager=mgr,
-    )
-else:
-    sio = socketio.AsyncServer(
-        cors_allowed_origins=[],
-        async_mode="asgi",
-        transports=(
-            ["polling", "websocket"] if ENABLE_WEBSOCKET_SUPPORT else ["polling"]
-        ),
-        allow_upgrades=ENABLE_WEBSOCKET_SUPPORT,
-        always_connect=True,
-    )
-
-
-# Dictionary to maintain the user pool
-
-if WEBSOCKET_MANAGER == "redis":
-    SESSION_POOL = RedisDict("open-webui:session_pool", redis_url=WEBSOCKET_REDIS_URL)
-    USER_POOL = RedisDict("open-webui:user_pool", redis_url=WEBSOCKET_REDIS_URL)
-    USAGE_POOL = RedisDict("open-webui:usage_pool", redis_url=WEBSOCKET_REDIS_URL)
-else:
-    SESSION_POOL = {}
-    USER_POOL = {}
-    USAGE_POOL = {}
-
-
-# Timeout duration in seconds
-TIMEOUT_DURATION = 3
-
-
-async def periodic_usage_pool_cleanup():
-    while True:
-        now = int(time.time())
-        for model_id, connections in list(USAGE_POOL.items()):
-            # Creating a list of sids to remove if they have timed out
-            expired_sids = [
-                sid
-                for sid, details in connections.items()
-                if now - details["updated_at"] > TIMEOUT_DURATION
-            ]
-
-            for sid in expired_sids:
-                del connections[sid]
-
-            if not connections:
-                log.debug(f"Cleaning up model {model_id} from usage pool")
-                del USAGE_POOL[model_id]
-            else:
-                USAGE_POOL[model_id] = connections
-
-            # Emit updated usage information after cleaning
-            await sio.emit("usage", {"models": get_models_in_use()})
-
-        await asyncio.sleep(TIMEOUT_DURATION)
-
-
-app = socketio.ASGIApp(
-    sio,
-    socketio_path="/ws/socket.io",
+# Initialize Socket.IO server
+sio = socketio.AsyncServer(
+    async_mode="asgi",
+    cors_allowed_origins=[],
+    logger=False,
+    engineio_logger=False,
 )
 
+# Initialize FastAPI app
+app = FastAPI()
+socket_app = socketio.ASGIApp(sio)
 
-def get_models_in_use():
-    # List models that are currently in use
-    models_in_use = list(USAGE_POOL.keys())
-    return models_in_use
+# Initialize managers
+session_manager = SessionManager(
+    use_redis=WEBSOCKET_MANAGER == "redis",
+    redis_url=WEBSOCKET_REDIS_URL
+)
 
+cleanup_job = SessionCleanupJob(interval_minutes=5)
 
-@sio.on("usage")
-async def usage(sid, data):
-    model_id = data["model"]
-    # Record the timestamp for the last update
-    current_time = int(time.time())
-
-    # Store the new usage data and task
-    USAGE_POOL[model_id] = {
-        **(USAGE_POOL[model_id] if model_id in USAGE_POOL else {}),
-        sid: {"updated_at": current_time},
-    }
-
-    # Broadcast the usage data to all clients
-    await sio.emit("usage", {"models": get_models_in_use()})
-
+############################
+# Socket Event Handlers
+############################
 
 @sio.event
 async def connect(sid, environ, auth):
-    user = None
-    if auth and "token" in auth:
+    """Handle new socket connections"""
+    try:
+        if not auth or "token" not in auth:
+            log.warning(f"Connection rejected - missing token: {sid}")
+            await sio.disconnect(sid)
+            return
+
         data = decode_token(auth["token"])
+        if not data or "id" not in data:
+            log.warning(f"Connection rejected - invalid token: {sid}")
+            await sio.disconnect(sid)
+            return
 
-        if data is not None and "id" in data:
-            user = Users.get_user_by_id(data["id"])
+        user = Users.get_user_by_id(data["id"])
+        if not user:
+            log.warning(f"Connection rejected - user not found: {sid}")
+            await sio.disconnect(sid)
+            return
 
-        if user:
-            SESSION_POOL[sid] = user.id
-            if user.id in USER_POOL:
-                USER_POOL[user.id].append(sid)
-            else:
-                USER_POOL[user.id] = [sid]
+        # Create new session
+        await session_manager.create_session(
+            user_id=user.id,
+            socket_id=sid,
+            token=auth["token"]
+        )
+        
+        log.info(f"New connection established: {sid} (User: {user.id})")
+        
+        # Emit detailed statistics
+        await sio.emit("user-count", await get_active_user_count())
+        await sio.emit("usage", {"models": await get_models_in_use()})
 
-            # print(f"user {user.name}({user.id}) connected with session ID {sid}")
-            await sio.emit("user-count", {"count": len(USER_POOL.items())})
-            await sio.emit("usage", {"models": get_models_in_use()})
-
-
-@sio.on("user-join")
-async def user_join(sid, data):
-    # print("user-join", sid, data)
-
-    auth = data["auth"] if "auth" in data else None
-    if not auth or "token" not in auth:
-        return
-
-    data = decode_token(auth["token"])
-    if data is None or "id" not in data:
-        return
-
-    user = Users.get_user_by_id(data["id"])
-    if not user:
-        return
-
-    SESSION_POOL[sid] = user.id
-    if user.id in USER_POOL:
-        USER_POOL[user.id].append(sid)
-    else:
-        USER_POOL[user.id] = [sid]
-
-    # print(f"user {user.name}({user.id}) connected with session ID {sid}")
-
-    await sio.emit("user-count", {"count": len(USER_POOL.items())})
-
-
-@sio.on("user-count")
-async def user_count(sid):
-    await sio.emit("user-count", {"count": len(USER_POOL.items())})
-
+    except Exception as e:
+        log.error(f"Error in connect handler: {e}")
+        await sio.disconnect(sid)
 
 @sio.event
 async def disconnect(sid):
-    if sid in SESSION_POOL:
-        user_id = SESSION_POOL[sid]
-        del SESSION_POOL[sid]
+    """Handle socket disconnections"""
+    try:
+        await session_manager.remove_session(sid)
+        log.info(f"Connection closed: {sid}")
+        
+        # Emit updated statistics
+        await sio.emit("user-count", await get_active_user_count())
+        await sio.emit("usage", {"models": await get_models_in_use()})
+    except Exception as e:
+        log.error(f"Error in disconnect handler: {e}")
 
-        USER_POOL[user_id] = [_sid for _sid in USER_POOL[user_id] if _sid != sid]
+@sio.event
+async def ping(sid):
+    """Handle ping events to keep connection alive"""
+    try:
+        await session_manager.update_session(sid)
+    except Exception as e:
+        log.error(f"Error in ping handler: {e}")
+        await sio.disconnect(sid)
 
-        if len(USER_POOL[user_id]) == 0:
-            del USER_POOL[user_id]
+@sio.event
+async def model_start(sid, model_id, metadata=None):
+    """Handle when a user starts using a model"""
+    try:
+        await session_manager.update_user_model(sid, model_id, metadata)
+        await sio.emit("usage", {"models": await get_models_in_use()})
+    except Exception as e:
+        log.error(f"Error in model_start handler: {e}")
 
-        await sio.emit("user-count", {"count": len(USER_POOL)})
-    else:
-        pass
-        # print(f"Unknown session ID {sid} disconnected")
+@sio.event
+async def model_stop(sid):
+    """Handle when a user stops using a model"""
+    try:
+        await session_manager.update_user_model(sid, None, None)
+        await sio.emit("usage", {"models": await get_models_in_use()})
+    except Exception as e:
+        log.error(f"Error in model_stop handler: {e}")
 
+############################
+# Helper Functions
+############################
 
-def get_event_emitter(request_info):
-    async def __event_emitter__(event_data):
-        await sio.emit(
-            "chat-events",
-            {
-                "chat_id": request_info["chat_id"],
-                "message_id": request_info["message_id"],
-                "data": event_data,
-            },
-            to=request_info["session_id"],
-        )
+async def get_active_user_count() -> Dict[str, int]:
+    """Get detailed user activity statistics"""
+    try:
+        with get_db() as db:
+            # Get total unique active users
+            total_users = db.query(UserSession.user_id)\
+                .distinct()\
+                .count()
+            
+            # Get users currently using models
+            active_users = db.query(UserSession.user_id)\
+                .filter(UserSession.current_model.isnot(None))\
+                .distinct()\
+                .count()
+            
+            return {
+                "total": total_users,
+                "active": active_users
+            }
+    except Exception as e:
+        log.error(f"Error getting user count: {e}")
+        return {"total": 0, "active": 0}
 
-    return __event_emitter__
+async def get_models_in_use() -> Dict[str, Dict]:
+    """Get detailed model usage statistics"""
+    try:
+        with get_db() as db:
+            # Query active sessions using models
+            sessions = db.query(UserSession)\
+                .filter(UserSession.current_model.isnot(None))\
+                .all()
+            
+            model_usage = {}
+            for session in sessions:
+                model_id = session.current_model
+                if model_id:
+                    if model_id not in model_usage:
+                        model_usage[model_id] = {
+                            "count": 0,
+                            "users": set(),
+                            "sessions": []
+                        }
+                    
+                    model_usage[model_id]["count"] += 1
+                    model_usage[model_id]["users"].add(session.user_id)
+                    model_usage[model_id]["sessions"].append({
+                        "socket_id": session.socket_id,
+                        "user_id": session.user_id,
+                        "metadata": session.model_metadata,
+                        "last_active": session.last_active.isoformat()
+                    })
+            
+            # Convert sets to lists for JSON serialization
+            for model in model_usage.values():
+                model["users"] = list(model["users"])
+                model["unique_users"] = len(model["users"])
+            
+            return model_usage
+    except Exception as e:
+        log.error(f"Error getting model usage: {e}")
+        return {}
 
+# Update FastAPI startup and shutdown events
+@app.on_event("startup")
+async def startup_event():
+    """Start the cleanup job on application startup"""
+    cleanup_job.start()
+    log.info("Socket application started - Cleanup job initialized")
 
-def get_event_call(request_info):
-    async def __event_call__(event_data):
-        response = await sio.call(
-            "chat-events",
-            {
-                "chat_id": request_info["chat_id"],
-                "message_id": request_info["message_id"],
-                "data": event_data,
-            },
-            to=request_info["session_id"],
-        )
-        return response
-
-    return __event_call__
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Stop the cleanup job on application shutdown"""
+    cleanup_job.stop()
+    log.info("Socket application shutting down - Cleanup job stopped")
